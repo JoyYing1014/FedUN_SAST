@@ -53,7 +53,8 @@ class FedUN_SecAgg_Server(FedUN):
 		if U_lsa <= T_lsa: U_lsa = T_lsa + 1
 
 		W_lsa = self._generate_mds_matrix(U_lsa, N_lsa)
-
+		# 👇 提前计算 total_samples！
+		total_samples = sum([c.local_training_number for c in protocol_clients])
 		# 参数解析
 		is_secagg_param = self.params.get('use_secagg', True) if hasattr(self, 'params') and self.params else True
 		if isinstance(is_secagg_param, str):
@@ -73,7 +74,15 @@ class FedUN_SecAgg_Server(FedUN):
 		Z_plaintexts, delta_plaintexts = {}, {}
 		# 👆 =======================
 
-		do_update_U = (self.u_update_freq > 0 and (self.current_comm_round + 1) % self.u_update_freq == 0)
+		# =========================================================================
+		# 【核心修复：分离预热与遗忘的子空间更新逻辑】
+		# 预热阶段：每一轮都强制更新子空间 U
+		# 遗忘阶段：受参数 u_update_freq 控制，为 0 时则完全不更新
+		# =========================================================================
+		if is_warmup:
+			do_update_U = True
+		else:
+			do_update_U = (self.u_update_freq > 0 and (self.current_comm_round + 1) % self.u_update_freq == 0)
 
 		for idx, client in enumerate(protocol_clients):
 			msg = {
@@ -84,6 +93,7 @@ class FedUN_SecAgg_Server(FedUN):
 				'gamma': gamma_to_send,
 				'do_projection': self.do_projection, 'epochs': self.epochs, 'lr': self.lr,
 				'target_module': self.module,
+				'total_samples': total_samples,
 				'use_secagg': is_secagg_enabled,
 				'U_lsa': U_lsa, 'T_lsa': T_lsa, 'N_lsa': N_lsa, 'W_lsa': W_lsa
 			}
@@ -125,6 +135,9 @@ class FedUN_SecAgg_Server(FedUN):
 		self.communication_time += com_time_end - com_time_start
 
 		cal_time_start = time.time()
+		# =========== 计算存活比例补偿 ===========
+		# total_samples = sum([c.local_training_number for c in protocol_clients])
+		surviving_p_sum = sum([protocol_clients[i].local_training_number for i in surviving_indices]) / total_samples
 
 		# --- 密文处理分支 ---
 		if is_secagg_enabled:
@@ -145,10 +158,13 @@ class FedUN_SecAgg_Server(FedUN):
 				# 🕵️‍♂️【探针验证 1：Z 矩阵】=========================
 				true_Z_sum = sum([Z_plaintexts[i] for i in surviving_indices if Z_plaintexts.get(i) is not None])
 				diff_Z = torch.max(torch.abs(Z_sum_real - true_Z_sum)).item()
-				print(f"🕵️‍♂️ [探针] 第 {self.current_comm_round} 轮 - Z矩阵解密最大误差: {diff_Z:.8f}")
+				print(
+					f"🕵️‍♂️ [探针] 第 {self.current_comm_round if not is_warmup else 'Warm-up'} 轮 - Z矩阵解密最大误差: {diff_Z:.8f}")
 				assert diff_Z < 1e-3, f"Z矩阵安全聚合解密失败！误差过大: {diff_Z}"
 				# ===============================================
 
+				# 👇 加入掉线补偿！
+				if surviving_p_sum > 0: Z_sum_real = Z_sum_real / surviving_p_sum
 				self.update_subspace_secagg(Z_sum_real)
 
 			# 【修复3】：严格保证只有在不是预热阶段时，才更新模型
@@ -166,17 +182,24 @@ class FedUN_SecAgg_Server(FedUN):
 				assert diff_delta < 1e-3, f"模型梯度安全聚合解密失败！误差过大: {diff_delta}"
 				# ===============================================
 
+				# 👇 加入掉线补偿！
+				if surviving_p_sum > 0: avg_grad = avg_grad / surviving_p_sum
 				self.update_module(self.module, self.optimizer, self.lr, avg_grad)
 
 		# --- 明文处理分支 ---
 		else:
 			if do_update_U:
 				z_list = [Z_ciphers[i] for i in surviving_indices if Z_ciphers[i] is not None]
-				if z_list: self.update_subspace_secagg(sum(z_list))
+				if z_list:
+					Z_sum_real = sum(z_list)
+					# 👇 加入掉线补偿！
+					if surviving_p_sum > 0: Z_sum_real = Z_sum_real / surviving_p_sum
+					self.update_subspace_secagg(Z_sum_real)
 
-			# 同理，明文模式下预热阶段也不更新模型
 			if not is_warmup:
 				grad_sum = sum([delta_ciphers[i] for i in surviving_indices])
+				# 👇 加入掉线补偿！
+				if surviving_p_sum > 0: grad_sum = grad_sum / surviving_p_sum
 				self.update_module(self.module, self.optimizer, self.lr, grad_sum)
 
 		cal_time_end = time.time()
