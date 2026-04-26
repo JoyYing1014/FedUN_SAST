@@ -2,10 +2,10 @@ import torch
 
 
 class SecAggMath:
-	def __init__(self, bit_length=61, scale=1e5):
-		# 使用 2^61 - 1 作为有限域的大小 q
+	def __init__(self, bit_length=55, scale=1e5):
+		#  有限域的大小 q
 		self.q = (1 << bit_length) - 1
-		self.scale = scale  # 缩放因子，保留浮点数的小数精度
+		self.scale = scale   # 缩放因子，保留浮点数的小数精度
 
 	def quantize_to_finite_field(self, tensor):
 		"""将实数张量量化并映射到有限域 F_q"""
@@ -28,5 +28,5 @@ class SecAggMath:
 		tensor_fq[is_negative] -= self.q
 
 		# 缩小回浮点数，并除以参与人数得到平均值
-		tensor_real = tensor_fq.to(torch.float32) / self.scale / num_clients
+		tensor_real = (tensor_fq.to(torch.float64) / self.scale / num_clients).to(torch.float32)
 		return tensor_real
