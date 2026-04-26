@@ -73,21 +73,26 @@ class FedOSD(fs.UnlearnAlgorithm):
 					gu_locals.append(g_locals[idx])
 				else:
 					gr_locals.append(g_locals[idx])
+			# 如果 gu_locals 为空，则跳过计算
+			if len(gu_locals) == 0:
+				print("Warning: gu_locals is empty, skipping this round's unlearning computation.")
+				self.communication_time += com_time_end - com_time_start
+				return
 			gu_locals = torch.vstack(gu_locals)
 			gr_locals = torch.vstack(gr_locals)
-			
+
 			weights = torch.Tensor([1 / len(gu_locals)] * len(gu_locals)).float().to(self.device)
 			gu = weights @ gu_locals
 			gu_norm = torch.norm(gu)
 			g_norm = gu_norm
-			
+
 			d, cal_time = self.get_nearest_oth_d(gr_locals, gu)
-			
+
 			d = d / torch.norm(d) * g_norm
-			
+
 			if self.test_conflicts:
 				self.stat_update_conflict(d, gr_locals)
-			
+
 			lr = self.lr
 			self.update_module(self.module, self.optimizer, lr, d)
 		else:
