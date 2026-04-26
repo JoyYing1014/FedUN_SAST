@@ -5,7 +5,7 @@ from sast.lightsecagg.SecAggMath import SecAggMath
 class FedUN_SecAgg_Client(fs.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.secagg_math = SecAggMath(bit_length=31) # 强制对齐 31
+        self.secagg_math = SecAggMath(bit_length=31, scale=1e5) # 强制对齐 31
         self.stored_Z_shares = {}
         self.stored_delta_shares = {}
 
@@ -78,7 +78,7 @@ class FedUN_SecAgg_Client(fs.Client):
                     'Z_shares': Z_shares, 'delta_shares': delta_shares,
                     'Z_meta': Z_meta, 'delta_meta': delta_meta, 'n_i': n_i
                 })
-                
+
             else:
                 return_msg.update({'Z_i_cipher': Z_i, 'delta_i_cipher': delta_i, 'n_i': n_i})
             return return_msg
