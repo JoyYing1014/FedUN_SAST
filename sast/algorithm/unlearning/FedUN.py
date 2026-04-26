@@ -183,21 +183,47 @@ class FedUN(fs.UnlearnAlgorithm):
 			self.update_subspace(g_ret_list)
 		
 		# (b) 遗忘客户端：梯度上升
-		if len(unlearn_clients) > 0:
-			_, _, g_u_list = self.train(target_client_list=unlearn_clients)
-			for i, client in enumerate(unlearn_clients):
+		# if len(unlearn_clients) > 0:
+		# 	_, _, g_u_list = self.train(target_client_list=unlearn_clients)
+		# 	for i, client in enumerate(unlearn_clients):
+		# 		n_i = client.local_training_number
+		# 		g_u = g_u_list[i]
+		#
+		# 		# 投影处理 (使用可能刚刚更新过的 U)
+		# 		if self.do_projection:
+		# 			g_final = self.get_projected_gradient(g_u)
+		# 		else:
+		# 			g_final = g_u
+		#
+		# 		weighted_grads.append(n_i * self.gamma * g_final)
+		# 		total_samples += n_i
+		# 必须先筛选出本轮【真正存活下来】的遗忘客户端
+		surviving_unlearn_clients = [
+			c for c in unlearn_clients
+			if c in self.online_client_list
+		]
+		print("surviving_unlearn_clients:", surviving_unlearn_clients)
+
+		if len(surviving_unlearn_clients) > 0:
+			# 只有当遗忘客户端本轮没掉线，才计算遗忘梯度
+			_, _, g_u_list = self.train(target_client_list=surviving_unlearn_clients)
+			for i, client in enumerate(surviving_unlearn_clients):
 				n_i = client.local_training_number
 				g_u = g_u_list[i]
-				
+
 				# 投影处理 (使用可能刚刚更新过的 U)
 				if self.do_projection:
 					g_final = self.get_projected_gradient(g_u)
 				else:
 					g_final = g_u
-				
+
 				weighted_grads.append(n_i * self.gamma * g_final)
 				total_samples += n_i
-		
+		else:
+			# ⚠️ 遗忘客户端本轮掉线了！
+			# 系统不崩溃，本轮只做保留客户端的恢复训练，暂停遗忘动作
+			print(
+				f"⚠️ [Warning] Unlearn client dropped out in round {self.current_comm_round}! Unlearning paused for this round.")
 		com_time_end = time.time()
 		
 		# 3. 聚合更新
