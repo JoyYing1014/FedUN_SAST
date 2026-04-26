@@ -161,14 +161,6 @@ class BasicTask:
 		parser.add_argument('--save_model', help='save model', type=str, default='True')
 		# 是否改变数据划分规则，如NC。--recreate True 强制重新生成当前配置的 .npy 文件并覆盖旧文件
 		parser.add_argument('--recreate', help='Force recreate data pool', type=str, default='False')
-		# === 新增 FedUN 参数 ===
-		parser.add_argument('--sast_beta', help='retained gradient weight for FedUN', type=float, default=1.0)
-		parser.add_argument('--sast_gamma', help='unlearning gradient weight for FedUN', type=float, default=5.0)  # 调大默认值
-		parser.add_argument('--do_projection', help='whether to do orthogonal projection', type=str, default='True')
-		parser.add_argument('--k', help='dimension of the approximate subspace', type=int, default=20)
-		parser.add_argument('--warmup_rounds', help='number of warm-up laps', type=int, default=10)
-		parser.add_argument('--u_update_freq', help='frequency of subspace update in unlearning', type=int, default=1)
-
 		# # 这是另一种叫 sort_and_split 的数据划分方式用到的参数，你在用 _pat 加载器时根本用不到它们。
 		# parser.add_argument('--SN', help='split num', type=int, default=200)
 		# parser.add_argument('--PN', help='pick num', type=int, default=2)
@@ -202,10 +194,53 @@ class BasicTask:
 		parser.add_argument('--random_update', help='random update attack', type=str, default='None')
 		# 零更新攻击（客户端上传 0）
 		parser.add_argument('--zero_update', help='zero update attack', type=str, default='None')
-		# --use_secagg False 关闭遗忘阶段的加密
-		parser.add_argument('--use_secagg', help='Whether to use SecAgg during unlearning',
-		                    type=lambda x: (str(x).lower() == 'true'), default=True)
+		# # === 新增 FedUN 参数 ===
+		# parser.add_argument('--sast_beta', help='retained gradient weight for FedUN', type=float, default=1.0)
+		# parser.add_argument('--sast_gamma', help='unlearning gradient weight for FedUN', type=float, default=5.0)  # 调大默认值
+		# parser.add_argument('--do_projection', help='whether to do orthogonal projection', type=str, default='True')
+		# parser.add_argument('--k', help='dimension of the approximate subspace', type=int, default=20)
+		# parser.add_argument('--warmup_rounds', help='number of warm-up laps', type=int, default=10)
+		# parser.add_argument('--u_update_freq', help='frequency of subspace update in unlearning', type=int, default=1)
+		# # --use_secagg False 关闭遗忘阶段的加密
+		# parser.add_argument('--use_secagg', help='Whether to use SecAgg during unlearning',
+		#                     type=lambda x: (str(x).lower() == 'true'), default=True)
+		# ==========================================================
+		# LightSecAgg (轻量级安全聚合) 核心参数
+		# ==========================================================
+		parser.add_argument('--use_secagg', type=str, default='True',
+		                    help='是否开启 LightSecAgg 安全聚合 (True/False)')
+		parser.add_argument('--C_clip', type=float, default=5.0,
+		                    help='安全聚合/FedUN 中的梯度裁剪阈值 (L2 Norm Bound)')
 
+		# ==========================================================
+		# 预训练阶段 (FedAvg) 子空间累积参数
+		# ==========================================================
+		parser.add_argument('--pretrain_subspace_update', type=str, default='False',
+		                    help='是否在 FedAvg 预训练阶段累积和更新子空间 U (True/False)')
+		parser.add_argument('--T_freq', type=int, default=10,
+		                    help='预训练阶段更新子空间 U 的频率 (每 T_freq 轮更新一次)')
+
+		# ==========================================================
+		# 遗忘阶段 (FedUN) 与子空间 U 参数
+		# ==========================================================
+		parser.add_argument('--k', type=int, default=20,
+		                    help='近似子空间 U 的特征维度 k')
+		parser.add_argument('--warmup_rounds', type=int, default=10,
+		                    help='FedUN 遗忘前的预热轮数 (如果不继承预训练U，则需要较长预热)')
+		parser.add_argument('--rho', type=float, default=0.5,
+		                    help='子空间更新时的流形指数滑动平均(EMA)动量参数')
+		parser.add_argument('--u_update_freq', type=int, default=1,
+		                    help='FedUN 遗忘阶段更新子空间 U 的频率 (0 表示不更新)')
+		parser.add_argument('--do_projection', type=str, default='True',
+		                    help='是否在遗忘阶段对遗忘梯度执行正交子空间投影 (True/False)')
+
+		# ==========================================================
+		# FedUN 损失权重参数
+		# ==========================================================
+		parser.add_argument('--sast_beta', type=float, default=1.0,
+		                    help='保留客户端 (Retained Clients) 的梯度权重')
+		parser.add_argument('--sast_gamma', type=float, default=5.0,
+		                    help='遗忘客户端 (Unlearned Clients) 的梯度下降(破坏)权重')
 		try:
 			if return_parser:
 				return parser
