@@ -1,6 +1,7 @@
 import time
 import torch
 import numpy as np
+import random
 from sast.algorithm.unlearning.FedUN import FedUN
 from sast.lightsecagg.SecAggMath import SecAggMath
 
@@ -8,34 +9,18 @@ from sast.lightsecagg.SecAggMath import SecAggMath
 class FedUN_SecAgg_Server(FedUN):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
-		self.secagg_math = SecAggMath()  # 注意：SecAggMath 中的 bit_length 应设为 61
-		# 初始梯度裁剪阈值
+		self.secagg_math = SecAggMath(bit_length=31, scale=1e5)
 		self.C_clip = self.params.get('C_clip', 5.0) if self.params else 5.0
+		self.online_rate_C = self.params.get('C', 1.0) if self.params else 1.0
 
-	def lightsecagg_decode_fq(self, cipher_list, mask_attr, clients):
-		"""有限域密文解密（模拟MDS消除掩码）"""
-		valid_ciphers = [c for c in cipher_list if c is not None]
-		if not valid_ciphers:
-			return None
-
-		# 1. 密文求和取模
-		sum_ciphers = torch.zeros_like(valid_ciphers[0], dtype=torch.int64)
-		for c in valid_ciphers:
-			sum_ciphers = torch.remainder(sum_ciphers + c, self.secagg_math.q)
-
-		# 2. 获取掩码总和
-		sum_masks = torch.zeros_like(sum_ciphers, dtype=torch.int64)
-		for client in clients:
-			mask = getattr(client, mask_attr)
-			if mask is not None:
-				sum_masks = torch.remainder(sum_masks + mask, self.secagg_math.q)
-
-		# 3. 密文和 - 掩码和 mod q
-		sum_fq = torch.remainder(sum_ciphers - sum_masks, self.secagg_math.q)
-		return sum_fq
+	def _generate_mds_matrix(self, U, N):
+		W = torch.zeros((U, N), dtype=torch.int64, device=self.device)
+		for i in range(U):
+			for j in range(N):
+				W[i, j] = pow(j + 1, i, self.secagg_math.q)
+		return W
 
 	def update_subspace_secagg(self, Z_sum):
-		"""直接使用解密后的 Z_sum 更新子空间"""
 		if Z_sum is None:
 			return
 		U_hat, _ = torch.linalg.qr(Z_sum)
@@ -46,102 +31,139 @@ class FedUN_SecAgg_Server(FedUN):
 		U_next_unorth = (1 - self.rho) * self.U + self.rho * U_hat_aligned
 		self.U, _ = torch.linalg.qr(U_next_unorth)
 
-	def train_a_round(self):
-		"""重写 train_a_round，执行全密态安全聚合"""
+	# 【修复1】：加入 is_warmup 标识，防止预热阶段误更新模型
+	def train_a_round(self, is_warmup=False):
 		com_time_start = time.time()
-		cal_time_start = time.time()
 
 		unlearn_clients = [c for c in self.client_list if c.unlearn_flag]
 		retained_clients = [c for c in self.client_list if not c.unlearn_flag]
 
-		# 1. 抽样客户端
-		current_clients = []
+		selected_ret = []
 		if len(retained_clients) > 0:
 			num_ret = max(1, int(len(retained_clients) * self.sampling_rate))
 			num_ret = min(len(retained_clients), num_ret)
-			choose_indices = np.random.choice(len(retained_clients), num_ret, replace=False)
-			current_clients.extend([retained_clients[i] for i in choose_indices])
+			selected_ret = random.sample(retained_clients, num_ret)
 
-		current_clients.extend(unlearn_clients)  # 遗忘客户端强制参与
+		protocol_clients = selected_ret + unlearn_clients
+		N_lsa = len(protocol_clients)
+
+		surviving_count = max(2, int(N_lsa * self.online_rate_C))
+		U_lsa = surviving_count
+		T_lsa = max(1, U_lsa // 2)
+		if U_lsa <= T_lsa: U_lsa = T_lsa + 1
+
+		W_lsa = self._generate_mds_matrix(U_lsa, N_lsa)
+
+		# 参数解析
+		is_secagg_param = self.params.get('use_secagg', True) if hasattr(self, 'params') and self.params else True
+		if isinstance(is_secagg_param, str):
+			is_secagg_enabled = is_secagg_param.lower() in ['true', '1', 't', 'y', 'yes']
+		else:
+			is_secagg_enabled = bool(is_secagg_param)
+
+		# 【修复2】：在预热阶段，把发给客户端的模型更新权重置为 0，只收集用于更新 U 的特征矩阵 Z
+		beta_to_send = 0.0 if is_warmup else self.beta
+		gamma_to_send = 0.0 if is_warmup else self.gamma
+
+		all_Z_shares = {j: {} for j in range(N_lsa)}
+		all_delta_shares = {j: {} for j in range(N_lsa)}
+		Z_ciphers, delta_ciphers = {}, {}
+		Z_meta, delta_meta = None, None
 
 		do_update_U = (self.u_update_freq > 0 and (self.current_comm_round + 1) % self.u_update_freq == 0)
-		U_t_to_send = self.U if do_update_U else None
 
-		Z_i_cipher_list = []
-		delta_i_cipher_list = []
-		Z_clients = []
-
-		# 【核心修改 4】：提前计算本轮参与客户端的总样本量
-		total_samples = sum([client.local_training_number for client in current_clients])
-
-		# 尝试从命令行参数读取开关，如果没有则默认开启
-		is_secagg_enabled = getattr(self.params, 'use_secagg', True) if hasattr(self, 'params') else getattr(self, 'use_secagg', True)
-
-		# 2. 收集密文
-		for client in current_clients:
+		for idx, client in enumerate(protocol_clients):
 			msg = {
 				'command': 'cal_secagg_update',
-				'U_t': U_t_to_send,
+				'U_t': self.U if do_update_U else None,
 				'C_clip': self.C_clip,
-				'beta': self.beta,
-				'gamma': self.gamma,
-				'do_projection': self.do_projection,
-				'epochs': self.epochs,
-				'lr': self.lr,
+				'beta': beta_to_send,
+				'gamma': gamma_to_send,
+				'do_projection': self.do_projection, 'epochs': self.epochs, 'lr': self.lr,
 				'target_module': self.module,
-				'total_samples': total_samples,  # <--- 将计算好的总数传给客户端
-				'use_secagg': is_secagg_enabled  # 👇 新增这一行：把指令下发给客户端
+				'use_secagg': is_secagg_enabled,
+				'U_lsa': U_lsa, 'T_lsa': T_lsa, 'N_lsa': N_lsa, 'W_lsa': W_lsa
 			}
 			res = client.get_message(msg)
+			Z_ciphers[idx] = res.get('Z_i_cipher')
+			delta_ciphers[idx] = res.get('delta_i_cipher')
 
-			if res.get('Z_i_cipher') is not None:
-				Z_i_cipher_list.append(res['Z_i_cipher'])
-				Z_clients.append(client)
+			if is_secagg_enabled:
+				if res.get('Z_shares'):
+					for j in range(N_lsa): all_Z_shares[j][idx] = res['Z_shares'][j]
+					Z_meta = res['Z_meta']
+				for j in range(N_lsa): all_delta_shares[j][idx] = res['delta_shares'][j]
+				delta_meta = res['delta_meta']
 
-			delta_i_cipher_list.append(res['delta_i_cipher'])
+		surviving_indices = random.sample(range(N_lsa), surviving_count)
+		decoder_indices = surviving_indices[:U_lsa]
+		Z_agg_shares, delta_agg_shares = [], []
+
+		if is_secagg_enabled:
+			for j in surviving_indices:
+				protocol_clients[j].get_message({
+					'command': 'store_shares',
+					'Z_shares': all_Z_shares[j],
+					'delta_shares': all_delta_shares[j]
+				})
+
+			for j in decoder_indices:
+				res = protocol_clients[j].get_message(
+					{'command': 'aggregate_shares', 'surviving_indices': surviving_indices})
+				if res.get('Z_agg') is not None: Z_agg_shares.append(res['Z_agg'])
+				if res.get('delta_agg') is not None: delta_agg_shares.append(res['delta_agg'])
 
 		com_time_end = time.time()
+		if not hasattr(self, 'communication_time'): self.communication_time = 0.0
+		self.communication_time += com_time_end - com_time_start
 
-		# 3. 服务器安全解密与模型更新
+		cal_time_start = time.time()
 
-		# 尝试从命令行参数读取开关，如果没有则默认开启 (确保容错)
-		is_secagg_enabled = getattr(self.params, 'use_secagg', True) if hasattr(self, 'params') else getattr(self,
-		                                                                                                     'use_secagg',
-		                                                                                                     True)
+		# --- 密文处理分支 ---
+		if is_secagg_enabled:
+			Z_mask_sum = self.secagg_math.lightsecagg_decode(Z_agg_shares, decoder_indices, W_lsa, U_lsa, T_lsa,
+			                                                 Z_meta[0], Z_meta[1]) if Z_agg_shares else None
+			delta_mask_sum = self.secagg_math.lightsecagg_decode(delta_agg_shares, decoder_indices, W_lsa, U_lsa, T_lsa,
+			                                                     delta_meta[0],
+			                                                     delta_meta[1]) if delta_agg_shares else None
 
-		# (A) 解密/聚合更新子空间
-		if do_update_U and len(Z_i_cipher_list) > 0:
-			if is_secagg_enabled:
-				# 【加密模式】：解码掩码并反量化
-				Z_sum_fq = self.lightsecagg_decode_fq(Z_i_cipher_list, 'mask_Z_fq', Z_clients)
-				# 反量化时直接除以1，因为我们要的是外积矩阵的总和
-				Z_sum_real = self.secagg_math.dequantize_from_finite_field(Z_sum_fq, num_clients=1)
-			else:
-				# 【明文模式】：直接将客户端传来的真实浮点张量求和
-				Z_sum_real = sum(Z_i_cipher_list)
+			if do_update_U and Z_mask_sum is not None:
+				Z_cipher_sum = torch.zeros_like(Z_mask_sum, dtype=torch.int64)
+				for i in surviving_indices:
+					if Z_ciphers[i] is not None:
+						Z_cipher_sum = torch.remainder(Z_cipher_sum + Z_ciphers[i], self.secagg_math.q)
+				Z_sum_fq = torch.remainder(Z_cipher_sum - Z_mask_sum, self.secagg_math.q)
+				Z_sum_real = self.secagg_math.dequantize_from_finite_field(Z_sum_fq, 1)
 
-			self.update_subspace_secagg(Z_sum_real)
+				self.update_subspace_secagg(Z_sum_real)
 
-		# (B) 解密/聚合更新模型
-		if total_samples > 0 and len(delta_i_cipher_list) > 0:
-			if is_secagg_enabled:
-				# 【加密模式】：解码掩码并反量化
-				delta_sum_fq = self.lightsecagg_decode_fq(delta_i_cipher_list, 'mask_Delta_fq', current_clients)
-				# 【核心保留】：客户端已经用 p_i 做过比例加权，这里的总和就是标准的联邦平均梯度
-				# 因此，反量化时直接除以 1 (或传入 num_clients=1)，不要再除以参与人数或样本总数！
-				avg_grad_real = self.secagg_math.dequantize_from_finite_field(delta_sum_fq, num_clients=1)
-			else:
-				# 【明文模式】：客户端传回来的已经是加权后的真实梯度，直接求和即为联邦平均梯度
-				avg_grad_real = sum(delta_i_cipher_list)
+			# 【修复3】：严格保证只有在不是预热阶段时，才更新模型
+			if not is_warmup and delta_mask_sum is not None:
+				delta_cipher_sum = torch.zeros_like(delta_mask_sum, dtype=torch.int64)
+				for i in surviving_indices:
+					delta_cipher_sum = torch.remainder(delta_cipher_sum + delta_ciphers[i], self.secagg_math.q)
+				delta_sum_fq = torch.remainder(delta_cipher_sum - delta_mask_sum, self.secagg_math.q)
+				avg_grad = self.secagg_math.dequantize_from_finite_field(delta_sum_fq, 1)
 
-			self.update_module(self.module, self.optimizer, self.lr, avg_grad_real)
+				self.update_module(self.module, self.optimizer, self.lr, avg_grad)
+
+		# --- 明文处理分支 ---
+		else:
+			if do_update_U:
+				z_list = [Z_ciphers[i] for i in surviving_indices if Z_ciphers[i] is not None]
+				if z_list: self.update_subspace_secagg(sum(z_list))
+
+			# 同理，明文模式下预热阶段也不更新模型
+			if not is_warmup:
+				grad_sum = sum([delta_ciphers[i] for i in surviving_indices])
+				self.update_module(self.module, self.optimizer, self.lr, grad_sum)
 
 		cal_time_end = time.time()
-		self.communication_time += com_time_end - com_time_start
+		if not hasattr(self, 'computation_time'): self.computation_time = 0.0
 		self.computation_time += cal_time_end - cal_time_start
 
+	# 【修复4】：重写 run 函数，让预热阶段走 SECURE 通道
 	def run(self):
-		"""重写 run，确保 Warm-up 阶段的子空间更新也处于全密态保护之下"""
 		for client in self.client_list:
 			if client.unlearn_flag:
 				client.criterion = self.UnLearningCELoss()
@@ -149,61 +171,18 @@ class FedUN_SecAgg_Server(FedUN):
 		if self.U is None:
 			self.init_subspace()
 
-		print(f"=== Start SECURE Warm-up Phase for {self.warmup_rounds} rounds ===")
-		retained_clients = [c for c in self.client_list if not c.unlearn_flag]
-
+		# === 受安全聚合保护的预热阶段 ===
+		print(f"=== Start SECURE Warm-up Phase ({self.warmup_rounds} rounds, Online Rate C={self.online_rate_C}) ===")
 		for j in range(self.warmup_rounds):
-			if len(retained_clients) > 0:
-				num_participate = max(1, int(len(retained_clients) * self.sampling_rate))
-				num_participate = min(len(retained_clients), num_participate)
-				choose_indices = np.random.choice(len(retained_clients), num_participate, replace=False)
-				current_clients = [retained_clients[i] for i in choose_indices]
-
-				Z_i_cipher_list = []
-				Z_clients = []
-
-				# 预热阶段也要计算 total_samples 传下去（虽然这里 beta=0 没用到，但保持代码一致性）
-				total_samples = sum([client.local_training_number for client in current_clients])
-
-				for client in current_clients:
-					msg = {
-						'command': 'cal_secagg_update',
-						'U_t': self.U,
-						'C_clip': self.C_clip,
-						'beta': 0.0,  # 预热阶段不更新模型
-						'gamma': 0.0,  # 预热阶段不更新模型
-						'do_projection': False,
-						'epochs': self.epochs,
-						'lr': self.lr,
-						'target_module': self.module,
-						'total_samples': total_samples
-					}
-					res = client.get_message(msg)
-					if res.get('Z_i_cipher') is not None:
-						Z_i_cipher_list.append(res['Z_i_cipher'])
-						Z_clients.append(client)
-
-				if len(Z_i_cipher_list) > 0:
-					Z_sum_fq = self.lightsecagg_decode_fq(Z_i_cipher_list, 'mask_Z_fq', Z_clients)
-					Z_sum_real = self.secagg_math.dequantize_from_finite_field(Z_sum_fq, num_clients=1)
-					self.update_subspace_secagg(Z_sum_real)
-
+			self.current_comm_round = j  # 供 do_update_U 计算频率使用
+			self.train_a_round(is_warmup=True)
 			print(f"Secure Warm-up Round {j + 1}/{self.warmup_rounds} Done.")
-			# 【你需要在这里插入以下 3 行代码】：
-			self.current_comm_round = j  # 确保当前轮次正确
-			self.test()  # 强制进行全量考试
-			if hasattr(self, 'outFunc') and self.outFunc is not None:
-				# 智能提取静态方法的底层函数
-				actual_func = self.outFunc.__func__ if isinstance(self.outFunc, staticmethod) else self.outFunc
-				actual_func(self)
+		print("=== Warm-up Phase Finished. Subspace Ready. ===")
 
+		# === 受安全聚合保护的遗忘阶段 ===
 		print("=== Start SECURE Unlearning Phase ===")
+		self.current_comm_round = 0  # 轮次复位，供遗忘阶段使用
+
+		# 将测试和轮次推进依然交还给父类 while 循环底层的 update_module，防止“跳步”Bug
 		while not self.terminated():
-			self.train_a_round()
-			# 👇 【在此处新增以下 3 行代码】👇
-			self.current_comm_round += 1  # 确保轮数正常推进
-			self.test()  # 1. 触发所有客户端考试，把分数写进日志字典
-			if hasattr(self, 'outFunc') and self.outFunc is not None:
-				# 智能提取静态方法的底层函数
-				actual_func = self.outFunc.__func__ if isinstance(self.outFunc, staticmethod) else self.outFunc
-				actual_func(self)
+			self.train_a_round(is_warmup=False)
