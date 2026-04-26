@@ -31,7 +31,10 @@ class FedUN(fs.UnlearnAlgorithm):
 		super().__init__(name, data_loader, module, device, train_setting, client_num, client_list, online_client_num,
 		                 save_model, max_comm_round,
 		                 max_training_num, epochs, save_name, outFunc, write_log, dishonest, test_conflicts, params)
-
+		# 强制将遗忘截止轮次设定为总轮次，防止底层框架在 UR 轮后踢掉遗忘客户端。
+		self.UR = self.max_comm_round
+		if hasattr(self, 'params') and self.params is not None:
+			self.params['UR'] = self.max_comm_round
 		# === 读取超参数 ===
 		self.k = params.get('k', 20) if params else 20
 		self.warmup_rounds = params.get('warmup_rounds', 10) if params else 10
