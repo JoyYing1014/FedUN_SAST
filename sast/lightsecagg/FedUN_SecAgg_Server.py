@@ -69,6 +69,9 @@ class FedUN_SecAgg_Server(FedUN):
 		all_delta_shares = {j: {} for j in range(N_lsa)}
 		Z_ciphers, delta_ciphers = {}, {}
 		Z_meta, delta_meta = None, None
+		# 👇 探针变量：用于存放收到的明文
+		Z_plaintexts, delta_plaintexts = {}, {}
+		# 👆 =======================
 
 		do_update_U = (self.u_update_freq > 0 and (self.current_comm_round + 1) % self.u_update_freq == 0)
 
@@ -87,6 +90,10 @@ class FedUN_SecAgg_Server(FedUN):
 			res = client.get_message(msg)
 			Z_ciphers[idx] = res.get('Z_i_cipher')
 			delta_ciphers[idx] = res.get('delta_i_cipher')
+			# 👇 探针逻辑：提取明文
+			Z_plaintexts[idx] = res.get('plaintext_Z')
+			delta_plaintexts[idx] = res.get('plaintext_delta')
+			# 👆 ===================
 
 			if is_secagg_enabled:
 				if res.get('Z_shares'):
@@ -135,6 +142,13 @@ class FedUN_SecAgg_Server(FedUN):
 				Z_sum_fq = torch.remainder(Z_cipher_sum - Z_mask_sum, self.secagg_math.q)
 				Z_sum_real = self.secagg_math.dequantize_from_finite_field(Z_sum_fq, 1)
 
+				# 🕵️‍♂️【探针验证 1：Z 矩阵】=========================
+				true_Z_sum = sum([Z_plaintexts[i] for i in surviving_indices if Z_plaintexts.get(i) is not None])
+				diff_Z = torch.max(torch.abs(Z_sum_real - true_Z_sum)).item()
+				print(f"🕵️‍♂️ [探针] 第 {self.current_comm_round} 轮 - Z矩阵解密最大误差: {diff_Z:.8f}")
+				assert diff_Z < 1e-3, f"Z矩阵安全聚合解密失败！误差过大: {diff_Z}"
+				# ===============================================
+
 				self.update_subspace_secagg(Z_sum_real)
 
 			# 【修复3】：严格保证只有在不是预热阶段时，才更新模型
@@ -144,6 +158,13 @@ class FedUN_SecAgg_Server(FedUN):
 					delta_cipher_sum = torch.remainder(delta_cipher_sum + delta_ciphers[i], self.secagg_math.q)
 				delta_sum_fq = torch.remainder(delta_cipher_sum - delta_mask_sum, self.secagg_math.q)
 				avg_grad = self.secagg_math.dequantize_from_finite_field(delta_sum_fq, 1)
+
+				# 🕵️‍♂️【探针验证 2：模型参数梯度】====================
+				true_delta_sum = sum([delta_plaintexts[i] for i in surviving_indices])
+				diff_delta = torch.max(torch.abs(avg_grad - true_delta_sum)).item()
+				print(f"🕵️‍♂️ [探针] 第 {self.current_comm_round} 轮 - 模型梯度解密最大误差: {diff_delta:.8f}")
+				assert diff_delta < 1e-3, f"模型梯度安全聚合解密失败！误差过大: {diff_delta}"
+				# ===============================================
 
 				self.update_module(self.module, self.optimizer, self.lr, avg_grad)
 
@@ -162,27 +183,32 @@ class FedUN_SecAgg_Server(FedUN):
 		if not hasattr(self, 'computation_time'): self.computation_time = 0.0
 		self.computation_time += cal_time_end - cal_time_start
 
-	# 【修复4】：重写 run 函数，让预热阶段走 SECURE 通道
 	def run(self):
+		import os
+
+		# 翻转遗忘客户端损失函数，确保向背离后门方向优化
 		for client in self.client_list:
 			if client.unlearn_flag:
 				client.criterion = self.UnLearningCELoss()
 
+		# === 核心：自动继承预训练阶段维护的真实子空间 ===
 		if self.U is None:
-			self.init_subspace()
+			u_path = os.path.join(getattr(self, 'save_dir', '.'), 'pretrained_U.pt')
+			if os.path.exists(u_path):
+				self.U = torch.load(u_path, map_location=self.device)
+				print(f"\n=> [INHERIT SUCCESS] Successfully loaded true pre-trained subspace U from '{u_path}'!")
+			else:
+				self.init_subspace()
 
-		# === 受安全聚合保护的预热阶段 ===
-		print(f"=== Start SECURE Warm-up Phase ({self.warmup_rounds} rounds, Online Rate C={self.online_rate_C}) ===")
+		# ---------------- 预热阶段 ----------------
+		print(f"\n=== Start SECURE Warm-up Phase ({self.warmup_rounds} rounds, Online Rate C={self.online_rate_C}) ===")
 		for j in range(self.warmup_rounds):
-			self.current_comm_round = j  # 供 do_update_U 计算频率使用
 			self.train_a_round(is_warmup=True)
 			print(f"Secure Warm-up Round {j + 1}/{self.warmup_rounds} Done.")
-		print("=== Warm-up Phase Finished. Subspace Ready. ===")
+		print("=== Warm-up Phase Finished. Subspace Ready. ===\n")
 
-		# === 受安全聚合保护的遗忘阶段 ===
+		# ---------------- 遗忘阶段 ----------------
 		print("=== Start SECURE Unlearning Phase ===")
-		self.current_comm_round = 0  # 轮次复位，供遗忘阶段使用
-
-		# 将测试和轮次推进依然交还给父类 while 循环底层的 update_module，防止“跳步”Bug
+		# 将测试和轮次推进依然交还给父类 while 循环底层的 update_module
 		while not self.terminated():
 			self.train_a_round(is_warmup=False)
