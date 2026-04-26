@@ -88,6 +88,9 @@ class FedAvg_SecAgg_Server(fs.FedAvg):
 		all_delta_shares = {j: {} for j in range(N_lsa)}
 		all_Z_shares = {j: {} for j in range(N_lsa)}
 		delta_ciphers, Z_ciphers = {}, {}
+		# 👇 探针变量：用于存放收到的明文
+		delta_plaintexts, Z_plaintexts = {}, {}
+		# 👆 =======================
 		delta_meta, Z_meta = None, None
 		total_samples = sum([c.local_training_number for c in current_clients])
 
@@ -103,14 +106,21 @@ class FedAvg_SecAgg_Server(fs.FedAvg):
 				'epochs': self.epochs,
 				'lr': self.lr,
 				'target_module': self.module,
+				'total_samples': total_samples,
 				'use_secagg': is_secagg_enabled,
 				'U_lsa': U_lsa, 'T_lsa': T_lsa, 'N_lsa': N_lsa, 'W_lsa': W_lsa
 			}
 			res = client.get_message(msg)
 
 			delta_ciphers[idx] = res.get('delta_i_cipher')
+			# 👇 提取模型梯度明文
+			delta_plaintexts[idx] = res.get('plaintext_delta')
+			# 👆 =======================
 			if do_update_U:
 				Z_ciphers[idx] = res.get('Z_i_cipher')
+				# 👇 提取 Z 矩阵明文
+				Z_plaintexts[idx] = res.get('plaintext_Z')
+				# 👆 =======================
 
 			if is_secagg_enabled:
 				if res.get('delta_shares'):
@@ -168,6 +178,12 @@ class FedAvg_SecAgg_Server(fs.FedAvg):
 							Z_cipher_sum = torch.remainder(Z_cipher_sum + Z_ciphers[i], self.secagg_math.q)
 					Z_sum_fq = torch.remainder(Z_cipher_sum - Z_mask_sum, self.secagg_math.q)
 					Z_sum_real = self.secagg_math.dequantize_from_finite_field(Z_sum_fq, 1)
+					# 🕵️‍♂️【探针 1：预训练 Z 矩阵】=========================
+					true_Z_sum = sum([Z_plaintexts[i] for i in surviving_indices if Z_plaintexts.get(i) is not None])
+					diff_Z = torch.max(torch.abs(Z_sum_real - true_Z_sum)).item()
+					print(f"🕵️‍♂️ [预训练探针] 第 {self.current_comm_round} 轮 - Z矩阵最大误差: {diff_Z:.8f}")
+					assert diff_Z < 1e-3, f"预训练 Z 矩阵安全聚合解密失败！误差: {diff_Z}"
+					# ===============================================
 					if surviving_p_sum > 0: Z_sum_real = Z_sum_real / surviving_p_sum
 					self.update_subspace_secagg(Z_sum_real)
 
@@ -178,7 +194,13 @@ class FedAvg_SecAgg_Server(fs.FedAvg):
 					delta_cipher_sum = torch.remainder(delta_cipher_sum + delta_ciphers[i], self.secagg_math.q)
 				delta_sum_fq = torch.remainder(delta_cipher_sum - delta_mask_sum, self.secagg_math.q)
 				avg_grad = self.secagg_math.dequantize_from_finite_field(delta_sum_fq, 1)
-
+				# 🕵️‍♂️【探针 2：预训练全局模型梯度】====================
+				true_delta_sum = sum(
+					[delta_plaintexts[i] for i in surviving_indices if delta_plaintexts.get(i) is not None])
+				diff_delta = torch.max(torch.abs(avg_grad - true_delta_sum)).item()
+				print(f"🕵️‍♂️ [预训练探针] 第 {self.current_comm_round} 轮 - 模型梯度最大误差: {diff_delta:.8f}")
+				assert diff_delta < 1e-3, f"预训练模型梯度安全聚合解密失败！误差: {diff_delta}"
+				# ===============================================
 				if surviving_p_sum > 0: avg_grad = avg_grad / surviving_p_sum
 				self.update_module(self.module, self.optimizer, self.lr, avg_grad)
 		else:
