@@ -12,6 +12,7 @@ if __name__ == '__main__':
     my_task = fs.Fedunlearning()
     # ================== 拦截验证测试 ==================
     print("\n" + "=" * 50)
+    print("【拦截验证】当前 fs.FedAvg 指向的类是:", fs.FedAvg)  # 新增这一行
     print("【拦截验证】当前使用的算法类是:", type(my_task.algorithm))
     print("【拦截验证】当前使用的客户端类是:", type(my_task.algorithm.client_list[0]))
     print("=" * 50 + "\n")
