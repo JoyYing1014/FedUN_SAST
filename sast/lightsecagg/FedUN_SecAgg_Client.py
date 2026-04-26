@@ -68,11 +68,17 @@ class FedUN_SecAgg_Client(fs.Client):
                 delta_shares, d_shape, d_pad = self.secagg_math.lightsecagg_encode(self.mask_Delta_fq, U_lsa, T_lsa, N_lsa, W_lsa, self.device)
                 delta_meta = (d_shape, d_pad)
 
+                # 在返回前，强行把原始明文也塞进去
                 return_msg.update({
                     'Z_i_cipher': Z_i_cipher, 'delta_i_cipher': delta_i_cipher,
+                    # 👇 加入探针：顺便把明文也打包传上去（仅作验证对比用，实际部署不会传）
+                    'plaintext_Z': Z_i,
+                    'plaintext_delta': delta_i,
+                    # 👆 ============================================
                     'Z_shares': Z_shares, 'delta_shares': delta_shares,
                     'Z_meta': Z_meta, 'delta_meta': delta_meta, 'n_i': n_i
                 })
+                
             else:
                 return_msg.update({'Z_i_cipher': Z_i, 'delta_i_cipher': delta_i, 'n_i': n_i})
             return return_msg
