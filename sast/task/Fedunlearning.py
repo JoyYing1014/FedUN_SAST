@@ -16,27 +16,54 @@ class Fedunlearning(fs.BasicTask):
         
         self.algorithm.save_folder = self.name + '/' + self.params['module'] + '/' + self.data_loader.nickname + '/UN' + str(self.params['unlearn_cn']) + '/E' + str(self.params['E']) + '/C' + str(self.params['C']) + '/' + self.params['algorithm'] + '/'
         unlearn_pretrain_flag = self.params['unlearn_pretrain']
-        
-        
-        pretrained_model_folder = self.name + '/' + self.params['module'] + '/' + self.data_loader.nickname + '/UN' + str(self.params['unlearn_cn']) + '/E' + str(self.params['E']) + '/'
+
+        # 直接定义包含参数 C 的新路径
+        pretrained_model_folder = self.name + '/' + self.params[
+            'module'] + '/' + self.data_loader.nickname + '/UN' + str(self.params['unlearn_cn']) + '/E' + str(
+            self.params['E']) + '/C' + str(self.params['C']) + '/'
         self.algorithm.pretrained_model_folder = pretrained_model_folder
-        if not unlearn_pretrain_flag:  
-            model_path = pretrained_model_folder + f'seed{self.params["seed"]}_unlearn_task_pretrained_model.pth'
+        # 定义模型完整路径
+        model_path = pretrained_model_folder + f'seed{self.params["seed"]}_unlearn_task_pretrained_model.pth'
+        if not unlearn_pretrain_flag:
+            # ================= [执行遗忘：仅从新路径读取] =================
+            if not os.path.isfile(model_path):
+                # 如果新路径下没有模型，直接报错，不再寻找旧模型
+                raise RuntimeError(f'未在路径下找到预训练模型: {model_path}。请先执行预训练。')
+            print(f"[Info] 正在加载模型: {model_path}")
+            self.algorithm.module.model.load_state_dict(torch.load(model_path))
+            self.algorithm.init_model_params = self.algorithm.module.span_model_params_to_vec()
+            self.algorithm.model_params = self.algorithm.module.span_model_params_to_vec()
+        else:
+            # ================= [执行预训练：保存至新路径] =================
+            self.algorithm.save_model = True
+            # 自动创建包含 C 的目录层级
             if not os.path.exists(pretrained_model_folder):
                 os.makedirs(pretrained_model_folder)
-            if not os.path.isfile(model_path):
-                raise RuntimeError(f'Please put the pretrained model in the path {model_path}.')
-            self.algorithm.module.model.load_state_dict(torch.load(model_path))
-            self.algorithm.init_model_params = self.algorithm.module.span_model_params_to_vec()  
-            self.algorithm.model_params = self.algorithm.module.span_model_params_to_vec()  
-        else:  
-            self.algorithm.save_model = True
-            self.algorithm.model_save_name = pretrained_model_folder + f'seed{self.params["seed"]}_unlearn_task_pretrained_model.pth'  
-            
+            self.algorithm.model_save_name = model_path
             if isinstance(self.algorithm, fs.UnlearnAlgorithm):
-                raise RuntimeError(f'When setting unlearn_pretrain_flag=True, you cannot run unlearning FL algorithm.')
-            
+                raise RuntimeError(f'当 unlearn_pretrain_flag=True 时，不能运行遗忘类算法。')
             self.algorithm.terminate_extra_execute = self.terminate_extra_execute
+
+
+        # pretrained_model_folder = self.name + '/' + self.params['module'] + '/' + self.data_loader.nickname + '/UN' + str(self.params['unlearn_cn']) + '/E' + str(self.params['E']) + '/'
+        # self.algorithm.pretrained_model_folder = pretrained_model_folder
+        # if not unlearn_pretrain_flag:
+        #     model_path = pretrained_model_folder + f'seed{self.params["seed"]}_unlearn_task_pretrained_model.pth'
+        #     if not os.path.exists(pretrained_model_folder):
+        #         os.makedirs(pretrained_model_folder)
+        #     if not os.path.isfile(model_path):
+        #         raise RuntimeError(f'Please put the pretrained model in the path {model_path}.')
+        #     self.algorithm.module.model.load_state_dict(torch.load(model_path))
+        #     self.algorithm.init_model_params = self.algorithm.module.span_model_params_to_vec()
+        #     self.algorithm.model_params = self.algorithm.module.span_model_params_to_vec()
+        # else:
+        #     self.algorithm.save_model = True
+        #     self.algorithm.model_save_name = pretrained_model_folder + f'seed{self.params["seed"]}_unlearn_task_pretrained_model.pth'
+        #
+        #     if isinstance(self.algorithm, fs.UnlearnAlgorithm):
+        #         raise RuntimeError(f'When setting unlearn_pretrain_flag=True, you cannot run unlearning FL algorithm.')
+        #
+        #     self.algorithm.terminate_extra_execute = self.terminate_extra_execute
 
         # 将字符串转为布尔值
         enable_backdoor = eval(self.params['enable_backdoor'])
@@ -54,7 +81,12 @@ class Fedunlearning(fs.BasicTask):
                     pretrain_attack_portion = 0.8 if unlearn_pretrain_flag else 1.0
                     self.modify_client(client, pretrain_attack_portion)
                 else:
-                    # 如果不开启后门，仅将训练数据同步给测试数据，确保评估正常
+                    # 关闭后门：将后门数据置为 None，防止测试模块计算伪 ASR
+                    print(f"Client {client.id} is unlearning target but BACKDOOR IS DISABLED.")
+                    setattr(client, "local_backdoor_test_data", None)
+                    setattr(client, "local_backdoor_test_number", 0)
+                    setattr(client, "backdoor_setting", None)
+                    # 确保基础测试集也被设置 如果不开启后门，仅将训练数据同步给测试数据，确保评估正常
                     client.local_test_data = copy.deepcopy(client.local_training_data)
                     client.local_test_number = client.local_training_number
                     # 仍需设置 test 对象以防报错，但使用基础的 ClientTest
@@ -121,21 +153,25 @@ class Fedunlearning(fs.BasicTask):
                     metric_dict['correct'] += correct_metric.calc(out, batch_y)
                 
                 self.metric_history['test_loss'].append(round(metric_dict['test_loss'] / client.local_test_number, 4))
-                self.metric_history['test_accuracy'].append(100 * metric_dict['correct'] / client.local_test_number)  
-                
-                metric_dict = {'test_loss': 0, 'correct': 0}
-                for [batch_x, batch_y] in client.local_backdoor_test_data:
-                    batch_x = fs.Module.change_data_device(batch_x, self.device)
-                    batch_y = fs.Module.change_data_device(batch_y, self.device)
-                    
-                    out = client.test_module.model(batch_x)  
-                    loss = criterion(out, batch_y).item()
-                    metric_dict['test_loss'] += float(loss) * batch_y.shape[0]  
-                    metric_dict['correct'] += correct_metric.calc(out, batch_y)
-                
-                self.metric_history['backdoor_test_loss'].append(round(metric_dict['test_loss'] / client.local_backdoor_test_number, 4))
-                self.metric_history['backdoor_test_accuracy'].append(100 * metric_dict['correct'] / client.local_backdoor_test_number)  
+                self.metric_history['test_accuracy'].append(100 * metric_dict['correct'] / client.local_test_number)
+                # 针对后门测试数据的安全处理
+                if hasattr(client, 'local_backdoor_test_data') and client.local_backdoor_test_data is not None:
+                    metric_dict = {'test_loss': 0, 'correct': 0}
+                    for [batch_x, batch_y] in client.local_backdoor_test_data:
+                        batch_x = fs.Module.change_data_device(batch_x, self.device)
+                        batch_y = fs.Module.change_data_device(batch_y, self.device)
 
+                        out = client.test_module.model(batch_x)
+                        loss = criterion(out, batch_y).item()
+                        metric_dict['test_loss'] += float(loss) * batch_y.shape[0]
+                        metric_dict['correct'] += correct_metric.calc(out, batch_y)
+
+                    self.metric_history['backdoor_test_loss'].append(round(metric_dict['test_loss'] / client.local_backdoor_test_number, 4))
+                    self.metric_history['backdoor_test_accuracy'].append(100 * metric_dict['correct'] / client.local_backdoor_test_number)
+                else:
+                    # 如果没有后门数据，填充 None 而不是 0.0，避免污染指标
+                    self.metric_history['backdoor_test_loss'].append(None)
+                    self.metric_history['backdoor_test_accuracy'].append(None)
     # @staticmethod
     # def outFunc(alg):
     #     unlearned_client_loss_list = []
@@ -219,6 +255,8 @@ class Fedunlearning(fs.BasicTask):
 
     @staticmethod
     def outFunc(alg):
+        # 读取是否启用了后门
+        enable_backdoor = str(alg.params.get('enable_backdoor', 'True')).lower() == 'true'
         unlearned_client_loss_list = []
         retained_client_loss_list = []
         for i, metric_history in enumerate(alg.metric_log['client_metric_history']):
@@ -240,10 +278,13 @@ class Fedunlearning(fs.BasicTask):
                 retained_client_local_acc_list.append(test_acc)
 
         unlearned_client_local_backdoor_acc_list = []
-        for i, metric_history in enumerate(alg.metric_log['client_metric_history']):
-            if alg.client_list[i].unlearn_flag:
-                test_acc = metric_history['backdoor_test_accuracy'][-1]
-                unlearned_client_local_backdoor_acc_list.append(test_acc)
+        # 仅在启用后门时提取 backdoor accuracy
+        if enable_backdoor:
+            for i, metric_history in enumerate(alg.metric_log['client_metric_history']):
+                if alg.client_list[i].unlearn_flag:
+                    test_acc = metric_history['backdoor_test_accuracy'][-1]
+                    if test_acc is not None:
+                        unlearned_client_local_backdoor_acc_list.append(test_acc)
 
         unlearned_client_local_acc_list = np.array(unlearned_client_local_acc_list)
         retained_client_local_acc_list = np.array(retained_client_local_acc_list)
@@ -260,7 +301,7 @@ class Fedunlearning(fs.BasicTask):
             retained_client_local_acc_list) > 0 else 0
 
         # ==========================================
-        # 2. 新增：全局测试准确率 (Global Test Acc)
+        # 2. 全局测试准确率 (Global Test Acc)
         # ==========================================
         global_acc = 0.0
         try:
@@ -270,20 +311,22 @@ class Fedunlearning(fs.BasicTask):
             print("⚠️ 警告: 未在 DataLoader 中找到 get_global_test_data 或 Algorithm 中找到 test_global。跳过全局测试。")
 
         # ==========================================
-        # 3. 新增：智能触发 MIA 评估
+        # 3. 智能触发 MIA 评估
         # ==========================================
         mia_acc = None
-        is_pretraining = getattr(alg, "unlearn_pretrain", False)
-        do_mia_test = False
+        pretrain_val = str(alg.params.get('unlearn_pretrain', 'False')).lower()
+        is_pretraining = pretrain_val == 'true'
+        # do_mia_test = False
+        do_mia_test = True
 
-        # 智能触发判定
-        if not is_pretraining:
-            # 在遗忘阶段 (SAST/FedOSD)，每次测试间隔都测 MIA，以记录遗忘轨迹
-            do_mia_test = True
-        else:
-            # 在预训练阶段，只在最后 5 轮测 MIA 以节省时间，确立 Baseline
-            if alg.current_comm_round >= alg.max_comm_round - 5:
-                do_mia_test = True
+        # # 智能触发判定
+        # if not is_pretraining:
+        #     # 在遗忘阶段 (SAST/FedOSD)，每次测试间隔都测 MIA，以记录遗忘轨迹
+        #     do_mia_test = True
+        # else:
+        #     # 在预训练阶段，只在最后 5 轮测 MIA 以节省时间，确立 Baseline
+        #     if alg.current_comm_round >= alg.max_comm_round - 5:
+        #         do_mia_test = True
 
         if do_mia_test:
             mia_evaluator = fs.MIAEvaluator(alg.device)
@@ -307,7 +350,18 @@ class Fedunlearning(fs.BasicTask):
                 mia_acc = np.mean(mia_acc_list)
 
         # ==========================================
-        # 4. 控制台日志格式化输出
+        # 4. 时间累加器
+        # ==========================================
+        # 在 alg 对象上动态挂载总时间属性，累加每一轮的时间
+        if not hasattr(alg, 'total_comm_time_accumulated'):
+            alg.total_comm_time_accumulated = 0.0
+            alg.total_comp_time_accumulated = 0.0
+
+        alg.total_comm_time_accumulated += alg.communication_time
+        alg.total_comp_time_accumulated += alg.computation_time
+
+        # ==========================================
+        # 5. 控制台日志格式化输出
         # ==========================================
         out_log = ""
         out_log += alg.save_name + ' ' + alg.data_loader.nickname + '\n'
@@ -323,8 +377,10 @@ class Fedunlearning(fs.BasicTask):
             unlearned_client_loss_list) > 0 else ''
         out_log += f'Unlearned Client Local Test Acc: {format(np.mean(unlearned_client_local_acc_list / 100), ".3f")}({format(np.std(unlearned_client_local_acc_list / 100), ".3f")}), angle: {format(unlearned_client_fairness, ".6f")}, min: {format(np.min(unlearned_client_local_acc_list), ".6f")}, max: {format(np.max(unlearned_client_local_acc_list), ".6f")}' + '\n' if len(
             unlearned_client_local_acc_list) > 0 else ''
-        out_log += f'ASR: {format(np.mean(unlearned_client_local_backdoor_acc_list / 100), ".3f")}({format(np.std(unlearned_client_local_backdoor_acc_list / 100), ".3f")}), min: {format(np.min(unlearned_client_local_backdoor_acc_list), ".6f")}, max: {format(np.max(unlearned_client_local_backdoor_acc_list), ".6f")}' + '\n' if len(
-            unlearned_client_local_backdoor_acc_list) > 0 else ''
+        # 仅当开启后门时才输出 ASR 日志
+        if enable_backdoor and len(unlearned_client_local_backdoor_acc_list) > 0:
+            out_log += f'ASR: {format(np.mean(unlearned_client_local_backdoor_acc_list / 100), ".3f")}({format(np.std(unlearned_client_local_backdoor_acc_list / 100), ".3f")}), min: {format(np.min(unlearned_client_local_backdoor_acc_list), ".6f")}, max: {format(np.max(unlearned_client_local_backdoor_acc_list), ".6f")}' + '\n' if len(
+                unlearned_client_local_backdoor_acc_list) > 0 else ''
         out_log += f'Retained Client Mean Global Test loss: {format(np.mean(retained_client_loss_list), ".6f")}' + '\n' if len(
             retained_client_loss_list) > 0 else ''
         out_log += f'Retained Client Local Test Acc: {format(np.mean(retained_client_local_acc_list / 100), ".3f")}({format(np.std(retained_client_local_acc_list / 100), ".3f")}), angle: {format(retained_client_fairness, ".6f")}, min: {format(np.min(retained_client_local_acc_list), ".6f")}, max: {format(np.max(retained_client_local_acc_list), ".6f")}' + '\n'
@@ -335,7 +391,7 @@ class Fedunlearning(fs.BasicTask):
         print(out_log)
 
         # ==========================================
-        # 5. CSV 文件记录逻辑 (扩充字段)
+        # 6. CSV 文件记录逻辑 (扩充字段)
         # ==========================================
         csv_file_name = f"metrics_{alg.run_id}.csv"
         csv_file_path = os.path.join(alg.save_folder, csv_file_name)
@@ -346,7 +402,10 @@ class Fedunlearning(fs.BasicTask):
         # 提取指标，防止空列表导致报错
         unl_loss = np.mean(unlearned_client_loss_list) if len(unlearned_client_loss_list) > 0 else 0
         unl_acc = np.mean(unlearned_client_local_acc_list) if len(unlearned_client_local_acc_list) > 0 else 0
-        asr = np.mean(unlearned_client_local_backdoor_acc_list) if len(unlearned_client_local_backdoor_acc_list) > 0 else 0
+        # asr = np.mean(unlearned_client_local_backdoor_acc_list) if len(unlearned_client_local_backdoor_acc_list) > 0 else 0
+        # 没有后门时 CSV 里 ASR 记为空字符串
+        asr = np.mean(unlearned_client_local_backdoor_acc_list) if (
+                    enable_backdoor and len(unlearned_client_local_backdoor_acc_list) > 0) else ""
         ret_loss = np.mean(retained_client_loss_list) if len(retained_client_loss_list) > 0 else 0
         ret_acc = np.mean(retained_client_local_acc_list) if len(retained_client_local_acc_list) > 0 else 0
 
@@ -368,11 +427,50 @@ class Fedunlearning(fs.BasicTask):
                 alg.communication_time, alg.computation_time
             ])
 
+        # ==========================================
+        # 7. 【新增】最后写入全局汇总表格的逻辑
+        # ==========================================
+        # 检查是否是最后一轮 (max_comm_round 是总轮数，由于轮数从 0 开始，最后一轮是 max_comm_round - 1)
+        if alg.current_comm_round == alg.max_comm_round:
+            # 存放在根目录或你指定的地方
+            summary_csv_path = "final_results_summary.csv"
+            summary_exists = os.path.isfile(summary_csv_path)
+
+            # 判断当前是预训练还是遗忘阶段
+            is_pretrain = str(alg.params.get('unlearn_pretrain', 'False')).lower() == 'true'
+            stage = "Pre-train" if is_pretrain else "Unlearn"
+
+            with open(summary_csv_path, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not summary_exists:
+                    # 如果文件刚创建，写入表头
+                    writer.writerow([
+                        'Dataset', 'N', 'NC', 'C', 'Stage',
+                        'Global_Acc(%)', 'ASR(%)', 'MIA(%)',
+                        'Total_Comm_Time(s)', 'Total_Comp_Time(s)', 'Retained_Acc(%)'
+                    ])
+
+                # 写入你关注的核心参数和这最后一轮的最终指标
+                writer.writerow([
+                    alg.params.get('dataloader', 'Unknown'),
+                    alg.params.get('N', 'Unknown'),
+                    alg.params.get('NC', 'Unknown'),
+                    alg.params.get('C', 'Unknown'),
+                    stage,
+                    round(global_acc, 3),  # 保留三位小数
+                    round(asr, 3) if asr != "" else "",  # 如果没有 ASR 就写入空值 后门成功率
+                    round(mia_acc, 3) if mia_acc is not None else "",
+                    round(alg.total_comm_time_accumulated, 2),  # 累加后的总通信时间
+                    round(alg.total_comp_time_accumulated, 2),  # 累加后的总计算时间
+                    # 新增的加载后面，不影响前面已经保存的
+                    round(ret_acc, 3)  # 保留三位小数
+                ])
+
     def read_params(self, return_parser=False):
         parser = super().read_params(return_parser=True)
 
         # 需要执行遗忘任务的客户端数量
-        parser.add_argument('--unlearn_cn', help='unlearn client num', type=int, default=0)
+        parser.add_argument('--unlearn_cn', help='unlearn client num', type=int, default=1)
         # 为 True 时先进行常规 FL 训练并保存模型；为 False 时加载已有的预训练模型执行遗忘
         parser.add_argument('--unlearn_pretrain', help='pretrain the model before unlearning', type=str, default=False)
         # 遗忘阶段的轮数（必须小于总轮数 R）
