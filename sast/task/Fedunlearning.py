@@ -78,7 +78,8 @@ class Fedunlearning(fs.BasicTask):
                 setattr(client, "unlearn_flag", True)
                 # 只有在 enable_backdoor 为 True 时才注入后门
                 if enable_backdoor:
-                    pretrain_attack_portion = 0.8 if unlearn_pretrain_flag else 1.0
+                    pretrain_attack_portion = 1.0
+                    # pretrain_attack_portion = 0.8 if unlearn_pretrain_flag else 1.0
                     self.modify_client(client, pretrain_attack_portion)
                 else:
                     # 关闭后门：将后门数据置为 None，防止测试模块计算伪 ASR
@@ -149,10 +150,17 @@ class Fedunlearning(fs.BasicTask):
                     
                     out = client.test_module.model(batch_x)  
                     loss = criterion(out, batch_y).item()
-                    metric_dict['test_loss'] += float(loss) * batch_y.shape[0]  
+                    metric_dict['test_loss'] += float(loss) * batch_y.shape[0]
+                    # # 1. 不要在这里取 .item()
+                    # loss = criterion(out, batch_y)
+                    # # 2. 使用 .detach() 取出数值张量在 GPU 上直接累加
+                    # metric_dict['test_loss'] += (loss.detach() * batch_y.shape[0])
                     metric_dict['correct'] += correct_metric.calc(out, batch_y)
                 
                 self.metric_history['test_loss'].append(round(metric_dict['test_loss'] / client.local_test_number, 4))
+                # # 循环外最终保存时，再 .item() 转为普通的 Python 浮点数
+                # self.metric_history['test_loss'].append(
+                #     round(metric_dict['test_loss'].item() / client.local_test_number, 4))
                 self.metric_history['test_accuracy'].append(100 * metric_dict['correct'] / client.local_test_number)
                 # 针对后门测试数据的安全处理
                 if hasattr(client, 'local_backdoor_test_data') and client.local_backdoor_test_data is not None:
@@ -160,13 +168,17 @@ class Fedunlearning(fs.BasicTask):
                     for [batch_x, batch_y] in client.local_backdoor_test_data:
                         batch_x = fs.Module.change_data_device(batch_x, self.device)
                         batch_y = fs.Module.change_data_device(batch_y, self.device)
-
                         out = client.test_module.model(batch_x)
                         loss = criterion(out, batch_y).item()
                         metric_dict['test_loss'] += float(loss) * batch_y.shape[0]
+                        # # 1. 不要在这里取 .item()
+                        # loss = criterion(out, batch_y)
+                        # # 2. 使用 .detach() 取出数值张量在 GPU 上直接累加
+                        # metric_dict['test_loss'] += (loss.detach() * batch_y.shape[0])
                         metric_dict['correct'] += correct_metric.calc(out, batch_y)
 
                     self.metric_history['backdoor_test_loss'].append(round(metric_dict['test_loss'] / client.local_backdoor_test_number, 4))
+                    # self.metric_history['backdoor_test_loss'].append(round(metric_dict['test_loss'].item() / client.local_backdoor_test_number, 4))
                     self.metric_history['backdoor_test_accuracy'].append(100 * metric_dict['correct'] / client.local_backdoor_test_number)
                 else:
                     # 如果没有后门数据，填充 None 而不是 0.0，避免污染指标
@@ -428,7 +440,35 @@ class Fedunlearning(fs.BasicTask):
             ])
 
         # ==========================================
-        # 7. 【新增】最后写入全局汇总表格的逻辑
+        # 7. 【新增】记录所有客户端ACC的日志 (每一轮记录)
+        # 行=Round，列=Client_X_ACC
+        # ==========================================
+        acc_csv_file_name = f"{alg.run_id}_acc.csv"
+        acc_csv_file_path = os.path.join(alg.save_folder, acc_csv_file_name)
+        acc_file_exists = os.path.isfile(acc_csv_file_path)
+
+        all_clients_acc = []
+        # 按顺序遍历提取每一个客户端在该轮最新的测试准确率
+        for metric_history in alg.metric_log['client_metric_history']:
+            if len(metric_history['test_accuracy']) > 0:
+                all_clients_acc.append(metric_history['test_accuracy'][-1])
+            else:
+                all_clients_acc.append(0.0)
+
+        with open(acc_csv_file_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            if not acc_file_exists:
+                # 第一行写入实验参数，便于追溯
+                writer.writerow(['# Experiment Parameters:', str(alg.params)])
+                # 写入表头：Round, Client_0_Acc, Client_1_Acc ...
+                headers = ['Round'] + [f'Client_{c.id}_Acc(%)' for c in alg.client_list]
+                writer.writerow(headers)
+
+            # 写入当前轮次的各客户端 ACC
+            writer.writerow([round_num] + all_clients_acc)
+
+        # ==========================================
+        # 8. 最后写入全局汇总表格的逻辑
         # ==========================================
         # 检查是否是最后一轮 (max_comm_round 是总轮数，由于轮数从 0 开始，最后一轮是 max_comm_round - 1)
         if alg.current_comm_round == alg.max_comm_round:
